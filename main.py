@@ -66,11 +66,19 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Слишком большое изображение. Максимум — 30 мегапикселей.")
             image = image.convert("RGBA")
-            # Preserve the complete photo: fit proportionally, never crop or stretch.
-            image.thumbnail((grid * 100, grid * 100), Image.Resampling.LANCZOS)
-            canvas = Image.new("RGBA", (grid * 100, grid * 100), (0, 0, 0, 0))
-            canvas.alpha_composite(image, ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2))
-            image = canvas
+            # Fill the square without distortion or transparent/empty edge tiles:
+            # use a blurred cover as the background and keep the complete photo on top.
+            from PIL import ImageFilter
+            size = grid * 100
+            background = ImageOps.fit(image, (size, size), method=Image.Resampling.LANCZOS)
+            background = background.filter(ImageFilter.GaussianBlur(radius=max(8, size // 35)))
+            foreground = image.copy()
+            foreground.thumbnail((size, size), Image.Resampling.LANCZOS)
+            background.alpha_composite(
+                foreground,
+                ((size - foreground.width) // 2, (size - foreground.height) // 2),
+            )
+            image = background
 
             result = []
             for row in range(grid):
@@ -102,7 +110,7 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
     # Telegram requires the pack name to end with _by_<bot_username>.
     unique = time.time_ns() // 1_000_000
     pack_name = f"p{user_id}_{unique}_by_{username}"
-    pack_title = f"Фото-пазл {grid}×{grid}"
+    pack_title = f"Эмодзи-пазл {grid}×{grid}"
     stickers = [
         InputSticker(
             sticker=BufferedInputFile(data, filename=f"tile_{index + 1}.webm" if video else f"tile_{index + 1}.webp"),
@@ -146,7 +154,7 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
             for col in range(grid):
                 output = root / ('tile_%s_%s.webm' % (row, col))
                 vf = ('fps=15,scale=%s:%s:force_original_aspect_ratio=decrease,' % (grid*100, grid*100) +
-                      'pad=%s:%s:(ow-iw)/2:(oh-ih)/2:color=black@0,' % (grid*100, grid*100) +
+                      'crop=%s:%s,' % (grid*100, grid*100) +
                       'crop=100:100:%s:%s,format=yuva420p' % (col*100, row*100))
                 cmd = [ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
                        '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '8',
@@ -167,7 +175,7 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
 
 def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
     # Telegram entity offsets are measured in UTF-16 code units.
-    placeholder = "😀"
+    placeholder = "🧩"
     lines = []
     entities = []
     offset = 0
