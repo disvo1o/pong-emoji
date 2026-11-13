@@ -141,15 +141,29 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
         await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker)
 
     sticker_set = await bot.get_sticker_set(name=pack_name)
-    # Fail loudly if Telegram did not register the uploaded WebM files as video.
-    if video and (
-        not getattr(sticker_set, "is_video", False)
-        or any(not getattr(sticker, "is_video", False) for sticker in sticker_set.stickers)
-    ):
+    # Bot API no longer returns StickerSet.is_video (deprecated/removed).
+    # Verify the format on every Sticker instead, and verify the set type.
+    if sticker_set.sticker_type != StickerType.CUSTOM_EMOJI:
         raise RuntimeError(
-            "Telegram сохранил набор не как видео-эмодзи. "
-            "Проверь формат WebM/VP9 и повтори загрузку."
+            f"Telegram создал набор неожиданного типа: {sticker_set.sticker_type}"
         )
+    if video:
+        non_video = [
+            index + 1
+            for index, sticker in enumerate(sticker_set.stickers)
+            if getattr(sticker, "is_video", None) is not True
+        ]
+        logger.info(
+            "Telegram sticker verification: set_type=%s, stickers=%s, non_video=%s",
+            sticker_set.sticker_type,
+            len(sticker_set.stickers),
+            non_video,
+        )
+        if non_video:
+            raise RuntimeError(
+                "Telegram сохранил некоторые фрагменты не как видео: "
+                + ", ".join(map(str, non_video[:10]))
+            )
     ids = [sticker.custom_emoji_id for sticker in sticker_set.stickers]
     if len(ids) != len(tiles) or any(not item for item in ids):
         raise RuntimeError(
