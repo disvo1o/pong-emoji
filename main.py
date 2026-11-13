@@ -65,20 +65,16 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             image.load()
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Слишком большое изображение. Максимум — 30 мегапикселей.")
-            image = image.convert("RGBA")
-            # Fill the square without distortion or transparent/empty edge tiles:
-            # use a blurred cover as the background and keep the complete photo on top.
-            from PIL import ImageFilter
+            # Prepare ONE square master image, then cut every tile from its exact
+            # pixel coordinates. No blurred padding or per-tile resizing: adjacent
+            # edges therefore come from the same source pixels.
             size = grid * 100
-            background = ImageOps.fit(image.convert("RGB"), (size, size), method=Image.Resampling.LANCZOS).convert("RGBA")
-            background = background.filter(ImageFilter.GaussianBlur(radius=max(8, size // 35)))
-            foreground = image.copy()
-            foreground.thumbnail((size, size), Image.Resampling.LANCZOS)
-            background.alpha_composite(
-                foreground,
-                ((size - foreground.width) // 2, (size - foreground.height) // 2),
-            )
-            image = background
+            image = ImageOps.fit(
+                image.convert("RGB"),
+                (size, size),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            ).convert("RGBA")
 
             result = []
             for row in range(grid):
@@ -135,6 +131,15 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
         await bot.add_sticker_to_set(user_id=user_id, name=pack_name, sticker=sticker)
 
     sticker_set = await bot.get_sticker_set(name=pack_name)
+    # Fail loudly if Telegram did not register the uploaded WebM files as video.
+    if video and (
+        not getattr(sticker_set, "is_video", False)
+        or any(not getattr(sticker, "is_video", False) for sticker in sticker_set.stickers)
+    ):
+        raise RuntimeError(
+            "Telegram сохранил набор не как видео-эмодзи. "
+            "Проверь формат WebM/VP9 и повтори загрузку."
+        )
     ids = [sticker.custom_emoji_id for sticker in sticker_set.stickers]
     if len(ids) != len(tiles) or any(not item for item in ids):
         raise RuntimeError(
@@ -153,13 +158,22 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
         for row in range(grid):
             for col in range(grid):
                 output = root / ('tile_%s_%s.webm' % (row, col))
-                vf = ('fps=15,scale=%s:%s:force_original_aspect_ratio=increase,' % (grid*100, grid*100) +
-                      'crop=%s:%s,' % (grid*100, grid*100) +
-                      'crop=100:100:%s:%s,format=yuva420p' % (col*100, row*100))
-                cmd = [ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
-                       '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '8',
-                       '-b:v', '250k', '-maxrate', '400k', '-bufsize', '600k',
-                       '-pix_fmt', 'yuva420p', '-r', '15', str(output)]
+                # All tiles use the same centered square crop and exact 100x100
+                # coordinates from that master frame. Keep VP9 alpha metadata explicit.
+                master = grid * 100
+                vf = (
+                    f"fps=30,scale={master}:{master}:force_original_aspect_ratio=increase,"
+                    f"crop={master}:{master}:(in_w-out_w)/2:(in_h-out_h)/2,"
+                    f"setsar=1,crop=100:100:{col*100}:{row*100},format=yuva420p"
+                )
+                cmd = [
+                    ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
+                    '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '4',
+                    '-row-mt', '1', '-auto-alt-ref', '0',
+                    '-b:v', '180k', '-maxrate', '250k', '-bufsize', '500k',
+                    '-pix_fmt', 'yuva420p', '-metadata:s:v:0', 'alpha_mode=1',
+                    '-r', '30', str(output)
+                ]
                 p = subprocess.run(cmd, capture_output=True, timeout=90)
                 if p.returncode or not output.exists():
                     raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
