@@ -210,7 +210,7 @@ async def receive_photo(message: Message, state: FSMContext) -> None:
         await message.answer("Файл слишком большой. Максимальный размер — 15 МБ.")
         return
     await state.set_state(PuzzleState.choosing_grid)
-    await state.update_data(image_bytes=raw)
+    await state.update_data(image_bytes=raw, media_type="image")
     await message.answer("Выбери, на сколько эмодзи разрезать фотографию:", reply_markup=grid_keyboard())
 
 
@@ -224,6 +224,9 @@ async def receive_video(message: Message, state: FSMContext) -> None:
     buffer = BytesIO()
     await bot.download_file(file.file_path, destination=buffer)
     raw = buffer.getvalue()
+    if len(raw) > MAX_IMAGE_BYTES:
+        await message.answer('Видео слишком большое. Максимум 15 МБ.')
+        return
     await state.set_state(PuzzleState.choosing_grid)
     await state.update_data(image_bytes=raw, media_type='video')
     await message.answer('Выбери сетку. Будут использованы первые 3 секунды видео:', reply_markup=grid_keyboard())
