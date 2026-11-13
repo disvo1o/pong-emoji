@@ -62,11 +62,11 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Слишком большое изображение. Максимум — 30 мегапикселей.")
             image = image.convert("RGBA")
-            side = min(image.size)
-            left = (image.width - side) // 2
-            top = (image.height - side) // 2
-            image = image.crop((left, top, left + side, top + side))
-            image = image.resize((grid * 100, grid * 100), Image.Resampling.LANCZOS)
+            # Preserve the complete photo: fit proportionally, never crop or stretch.
+            image.thumbnail((grid * 100, grid * 100), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGBA", (grid * 100, grid * 100), (0, 0, 0, 0))
+            canvas.alpha_composite(image, ((canvas.width - image.width) // 2, (canvas.height - image.height) // 2))
+            image = canvas
 
             result = []
             for row in range(grid):
