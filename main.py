@@ -179,7 +179,9 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
                     raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
                 data = output.read_bytes()
                 if len(data) > 256 * 1024:
-                    cmd[cmd.index('250k')] = '120k'
+                    cmd[cmd.index('-b:v') + 1] = '90k'
+                    cmd[cmd.index('-maxrate') + 1] = '130k'
+                    cmd[cmd.index('-bufsize') + 1] = '260k'
                     subprocess.run(cmd, capture_output=True, timeout=90, check=True)
                     data = output.read_bytes()
                 if not data or len(data) > 256 * 1024:
