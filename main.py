@@ -84,12 +84,12 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
                     tile.save(output, format="WEBP", quality=88, method=6)
                     data = output.getvalue()
                     quality = 80
-                    while len(data) > 64 * 1024 and quality >= 40:
+                    while len(data) > 60 * 1024 and quality >= 30:
                         output = BytesIO()
                         tile.save(output, format="WEBP", quality=quality, method=6)
                         data = output.getvalue()
                         quality -= 10
-                    if len(data) > 64 * 1024:
+                    if len(data) > 60 * 1024:
                         raise ValueError("Не удалось сжать один из фрагментов до лимита Telegram.")
                     result.append(data)
             return result
@@ -107,6 +107,16 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
     unique = time.time_ns() // 1_000_000
     pack_name = f"p{user_id}_{unique}_by_{username}"
     pack_title = f"Эмодзи-пазл {grid}×{grid}"
+    # Final local guard: never send files close to Telegram's hard upload limits.
+    max_upload_size = 180 * 1024 if video else 60 * 1024
+    oversized = [(i + 1, len(data)) for i, data in enumerate(tiles) if not data or len(data) > max_upload_size]
+    if oversized:
+        index, size = oversized[0]
+        raise ValueError(
+            f"Фрагмент №{index} слишком большой ({size} байт). "
+            "Уменьши сетку или выбери другое исходное медиа."
+        )
+
     stickers = [
         InputSticker(
             sticker=BufferedInputFile(data, filename=f"tile_{index + 1}.webm" if video else f"tile_{index + 1}.webp"),
@@ -166,26 +176,37 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
                     f"crop={master}:{master}:(in_w-out_w)/2:(in_h-out_h)/2,"
                     f"setsar=1,crop=100:100:{col*100}:{row*100},format=yuva420p"
                 )
-                cmd = [
-                    ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
-                    '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '4',
-                    '-row-mt', '1', '-auto-alt-ref', '0',
-                    '-b:v', '180k', '-maxrate', '250k', '-bufsize', '500k',
-                    '-pix_fmt', 'yuva420p', '-metadata:s:v:0', 'alpha_mode=1',
-                    '-r', '30', str(output)
-                ]
-                p = subprocess.run(cmd, capture_output=True, timeout=90)
-                if p.returncode or not output.exists():
-                    raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
-                data = output.read_bytes()
-                if len(data) > 256 * 1024:
-                    cmd[cmd.index('-b:v') + 1] = '90k'
-                    cmd[cmd.index('-maxrate') + 1] = '130k'
-                    cmd[cmd.index('-bufsize') + 1] = '260k'
-                    subprocess.run(cmd, capture_output=True, timeout=90, check=True)
+                # Keep a safety margin below Telegram's per-video-sticker size limit.
+                # Retry with progressively lower bitrates instead of uploading a borderline file.
+                data = b""
+                for bitrate, maxrate, bufsize in [
+                    ("100k", "150k", "300k"),
+                    ("70k", "100k", "200k"),
+                    ("45k", "65k", "130k"),
+                    ("30k", "45k", "90k"),
+                ]:
+                    cmd = [
+                        ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
+                        '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '4',
+                        '-row-mt', '1', '-auto-alt-ref', '0',
+                        '-b:v', bitrate, '-maxrate', maxrate, '-bufsize', bufsize,
+                        '-pix_fmt', 'yuva420p', '-metadata:s:v:0', 'alpha_mode=1',
+                        '-r', '20', str(output)
+                    ]
+                    p = subprocess.run(cmd, capture_output=True, timeout=90)
+                    if p.returncode or not output.exists():
+                        error_tail = p.stderr.decode("utf-8", errors="ignore")[-500:]
+                        logger.error("ffmpeg failed for tile %s,%s: %s", row, col, error_tail)
+                        raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
                     data = output.read_bytes()
-                if not data or len(data) > 256 * 1024:
-                    raise ValueError('Фрагмент превышает лимит Telegram 256 КБ. Попробуй более короткое видео.')
+                    if data and len(data) <= 180 * 1024:
+                        break
+                if not data or len(data) > 180 * 1024:
+                    raise ValueError(
+                        f'Фрагмент {row + 1}:{col + 1} не удалось сжать до безопасного размера. '
+                        'Попробуй более короткое видео или меньшую сетку.'
+                    )
+                logger.info("Video tile %s/%s size: %s bytes", row * grid + col + 1, grid * grid, len(data))
                 results.append(data)
     return results
 
