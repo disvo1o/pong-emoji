@@ -70,7 +70,7 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             # use a blurred cover as the background and keep the complete photo on top.
             from PIL import ImageFilter
             size = grid * 100
-            background = ImageOps.fit(image, (size, size), method=Image.Resampling.LANCZOS)
+            background = ImageOps.fit(image.convert("RGB"), (size, size), method=Image.Resampling.LANCZOS).convert("RGBA")
             background = background.filter(ImageFilter.GaussianBlur(radius=max(8, size // 35)))
             foreground = image.copy()
             foreground.thumbnail((size, size), Image.Resampling.LANCZOS)
@@ -153,7 +153,7 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
         for row in range(grid):
             for col in range(grid):
                 output = root / ('tile_%s_%s.webm' % (row, col))
-                vf = ('fps=15,scale=%s:%s:force_original_aspect_ratio=decrease,' % (grid*100, grid*100) +
+                vf = ('fps=15,scale=%s:%s:force_original_aspect_ratio=increase,' % (grid*100, grid*100) +
                       'crop=%s:%s,' % (grid*100, grid*100) +
                       'crop=100:100:%s:%s,format=yuva420p' % (col*100, row*100))
                 cmd = [ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
