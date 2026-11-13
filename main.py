@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+import subprocess
+import tempfile
 import time
+from pathlib import Path
 from io import BytesIO
 
 from aiogram import Bot, Dispatcher, F
@@ -20,6 +23,7 @@ from aiogram.types import (
     CallbackQuery,
 )
 from PIL import Image, ImageOps, UnidentifiedImageError
+import imageio_ffmpeg
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -89,7 +93,7 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
         raise ValueError("Не получилось прочитать изображение. Отправь JPG, PNG или WEBP.") from exc
 
 
-async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes]) -> tuple[str, list[str]]:
+async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], video: bool = False) -> tuple[str, list[str]]:
     me = await bot.get_me()
     username = (me.username or "").lower()
     if not username:
@@ -101,8 +105,8 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes]) 
     pack_title = f"Фото-пазл {grid}×{grid}"
     stickers = [
         InputSticker(
-            sticker=BufferedInputFile(data, filename=f"tile_{index + 1}.webp"),
-            format=StickerFormat.STATIC,
+            sticker=BufferedInputFile(data, filename=f"tile_{index + 1}.webm" if video else f"tile_{index + 1}.webp"),
+            format=StickerFormat.VIDEO if video else StickerFormat.STATIC,
             emoji_list=["🧩"],
         )
         for index, data in enumerate(tiles)
@@ -115,6 +119,7 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes]) 
         title=pack_title,
         stickers=stickers[:50],
         sticker_type=StickerType.CUSTOM_EMOJI,
+        sticker_format=StickerFormat.VIDEO if video else StickerFormat.STATIC,
     )
 
     # Custom emoji packs support up to 200 items, so 100 tiles fit in one pack.
@@ -129,6 +134,36 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes]) 
         )
     return pack_name, ids
 
+
+def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    results = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / 'source_video'
+        source.write_bytes(raw)
+        for row in range(grid):
+            for col in range(grid):
+                output = root / ('tile_%s_%s.webm' % (row, col))
+                vf = ('fps=15,scale=%s:%s:force_original_aspect_ratio=decrease,' % (grid*100, grid*100) +
+                      'pad=%s:%s:(ow-iw)/2:(oh-ih)/2:color=black@0,' % (grid*100, grid*100) +
+                      'crop=100:100:%s:%s,format=yuva420p' % (col*100, row*100))
+                cmd = [ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
+                       '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '8',
+                       '-b:v', '250k', '-maxrate', '400k', '-bufsize', '600k',
+                       '-pix_fmt', 'yuva420p', '-r', '15', str(output)]
+                p = subprocess.run(cmd, capture_output=True, timeout=90)
+                if p.returncode or not output.exists():
+                    raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
+                data = output.read_bytes()
+                if len(data) > 256 * 1024:
+                    cmd[cmd.index('250k')] = '120k'
+                    subprocess.run(cmd, capture_output=True, timeout=90, check=True)
+                    data = output.read_bytes()
+                if not data or len(data) > 256 * 1024:
+                    raise ValueError('Фрагмент превышает лимит Telegram 256 КБ. Попробуй более короткое видео.')
+                results.append(data)
+    return results
 
 def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
     # Telegram entity offsets are measured in UTF-16 code units.
@@ -155,8 +190,8 @@ def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[Mess
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Я превращаю фотографию в набор настоящих Telegram Custom Emoji 🧩\n\n"
-        "Отправь мне фотографию — я разрежу её на пазлы от 3×3 до 10×10, "
+        "Привет! Я превращаю фото и видео в набор настоящих Telegram Custom Emoji 🧩\n\n"
+        "Отправь фото или видео — я разрежу его на пазлы от 3×3 до 10×10, "
         "создам персональный набор эмодзи и покажу собранную картинку."
     )
 
@@ -179,11 +214,28 @@ async def receive_photo(message: Message, state: FSMContext) -> None:
     await message.answer("Выбери, на сколько эмодзи разрезать фотографию:", reply_markup=grid_keyboard())
 
 
+@dp.message(F.video)
+async def receive_video(message: Message, state: FSMContext) -> None:
+    video = message.video
+    if video.file_size and video.file_size > MAX_IMAGE_BYTES:
+        await message.answer('Видео слишком большое. Максимум 15 МБ.')
+        return
+    file = await bot.get_file(video.file_id)
+    buffer = BytesIO()
+    await bot.download_file(file.file_path, destination=buffer)
+    raw = buffer.getvalue()
+    await state.set_state(PuzzleState.choosing_grid)
+    await state.update_data(image_bytes=raw, media_type='video')
+    await message.answer('Выбери сетку. Будут использованы первые 3 секунды видео:', reply_markup=grid_keyboard())
+
+
 @dp.message(F.document)
 async def receive_document(message: Message, state: FSMContext) -> None:
     document = message.document
-    if not document.mime_type or not document.mime_type.startswith("image/"):
-        await message.answer("Пришли фотографию как изображение или файлом.")
+    is_video = bool(document.mime_type and document.mime_type.startswith("video/"))
+    is_image = bool(document.mime_type and document.mime_type.startswith("image/"))
+    if not (is_image or is_video):
+        await message.answer("Пришли фото или видео как файл.")
         return
     if document.file_size and document.file_size > MAX_IMAGE_BYTES:
         await message.answer("Файл слишком большой. Максимальный размер — 15 МБ.")
@@ -196,8 +248,8 @@ async def receive_document(message: Message, state: FSMContext) -> None:
         await message.answer("Файл слишком большой. Максимальный размер — 15 МБ.")
         return
     await state.set_state(PuzzleState.choosing_grid)
-    await state.update_data(image_bytes=raw)
-    await message.answer("Выбери размер пазла:", reply_markup=grid_keyboard())
+    await state.update_data(image_bytes=raw, media_type="video" if is_video else "image")
+    await message.answer("Выбери сетку. Будут использованы первые 3 секунды видео:" if is_video else "Выбери размер пазла:", reply_markup=grid_keyboard())
 
 
 @dp.callback_query(PuzzleState.choosing_grid, F.data.startswith("grid:"))
@@ -205,6 +257,7 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     data = await state.get_data()
     raw = data.get("image_bytes")
+    is_video = data.get("media_type") == "video"
     if not raw:
         await state.clear()
         await callback.message.answer("Изображение потерялось. Отправь фотографию ещё раз.")
@@ -219,8 +272,8 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
     await bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
 
     try:
-        tiles = await asyncio.to_thread(make_tiles, raw, grid)
-        pack_name, emoji_ids = await create_custom_emoji_pack(callback.from_user.id, grid, tiles)
+        tiles = await asyncio.to_thread(make_video_tiles if is_video else make_tiles, raw, grid)
+        pack_name, emoji_ids = await create_custom_emoji_pack(callback.from_user.id, grid, tiles, video=is_video)
 
         preview_text, entities = build_emoji_preview(grid, emoji_ids)
         await callback.message.answer(
@@ -252,7 +305,7 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.message()
 async def fallback(message: Message) -> None:
-    await message.answer("Отправь фотографию, и я превращу её в пазл из Telegram-эмодзи 🧩")
+    await message.answer("Отправь фото или видео, и я превращу его в пазл из Telegram-эмодзи 🧩")
 
 
 async def main() -> None:
