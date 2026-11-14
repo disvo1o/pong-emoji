@@ -321,7 +321,7 @@ def build_emoji_preview(rows: int, cols: int, emoji_ids: list[str]) -> tuple[str
                 custom_emoji_id=emoji_ids[row * cols + col],
             ))
             offset += 2
-        if row != grid - 1:
+        if row != rows - 1:
             offset += 1
     return "\n".join(lines), entities
 
