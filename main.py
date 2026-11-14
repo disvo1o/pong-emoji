@@ -145,7 +145,6 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
         title=pack_title,
         stickers=stickers[:50],
         sticker_type=StickerType.CUSTOM_EMOJI,
-        sticker_format=StickerFormat.VIDEO if video else StickerFormat.STATIC,
     )
 
     # Custom emoji packs support up to 200 items, so 100 tiles fit in one pack.
