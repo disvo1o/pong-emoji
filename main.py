@@ -303,6 +303,27 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
 
     return results
 
+def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
+    # Telegram entity offsets are measured in UTF-16 code units.
+    placeholder = "🧩"
+    lines = []
+    entities = []
+    offset = 0
+    for row in range(grid):
+        lines.append(placeholder * grid)
+        for col in range(grid):
+            entities.append(MessageEntity(
+                type="custom_emoji",
+                offset=offset,
+                length=2,
+                custom_emoji_id=emoji_ids[row * grid + col],
+            ))
+            offset += 2
+        if row != grid - 1:
+            offset += 1
+    return "\n".join(lines), entities
+
+
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -396,14 +417,15 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
         tiles = await asyncio.to_thread(make_video_tiles if is_video else make_tiles, raw, grid)
         pack_name, emoji_ids = await create_custom_emoji_pack(callback.from_user.id, grid, tiles, video=is_video)
 
-        preview = await asyncio.to_thread(make_mosaic_preview, raw, grid, is_video)
+        preview_text, entities = build_emoji_preview(grid, emoji_ids)
         await callback.message.answer(
-            f"Готово! {grid}×{grid} = {grid * grid} отдельных эмодзи.\n"
-            "Миниатюра всей картинки — ниже. В наборе фрагменты сохраняют полный размер и стыкуются без промежутков."
+            f"Готово! {grid}×{grid} = {grid * grid} отдельных эмодзи. Ниже — собранная картинка из самих эмодзи.",
         )
-        await callback.message.answer_photo(
-            BufferedInputFile(preview, filename="mosaic_preview.png"),
+        await callback.message.answer(
+            preview_text,
+            entities=entities,
             reply_to_message_id=source_message_id,
+            link_preview_options={"is_disabled": True},
         )
         await callback.message.answer(
             f"➕ <a href=\"https://t.me/addemoji/{pack_name}\">Добавить набор эмодзи в Telegram</a>",
