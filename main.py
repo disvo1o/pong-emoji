@@ -152,21 +152,26 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
             f"Telegram создал набор неожиданного типа: {sticker_set.sticker_type}"
         )
     if video:
-        non_video = [
+        invalid_video = [
             index + 1
             for index, sticker in enumerate(sticker_set.stickers)
-            if not bool(getattr(sticker, "is_video", False))
+            if (
+                not bool(getattr(sticker, "is_video", False))
+                or getattr(sticker, "width", None) != 100
+                or getattr(sticker, "height", None) != 100
+            )
         ]
         logger.info(
-            "Telegram sticker verification: set_type=%s, stickers=%s, video_flags=%s",
+            "Telegram sticker verification: set_type=%s, stickers=%s, video=%s, dimensions=%s",
             sticker_set.sticker_type,
             len(sticker_set.stickers),
             [bool(getattr(sticker, "is_video", False)) for sticker in sticker_set.stickers],
+            [(getattr(sticker, "width", None), getattr(sticker, "height", None)) for sticker in sticker_set.stickers],
         )
-        if non_video:
+        if invalid_video:
             raise RuntimeError(
-                "Telegram сохранил некоторые фрагменты не как видео: "
-                + ", ".join(map(str, non_video[:10]))
+                "Telegram сохранил фрагменты не как видеоэмодзи 100×100: "
+                + ", ".join(map(str, invalid_video[:10]))
             )
     ids = [sticker.custom_emoji_id for sticker in sticker_set.stickers]
     if len(ids) != len(tiles) or any(not item for item in ids):
@@ -237,12 +242,22 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
                     if data and len(data) <= 180 * 1024:
                         # Decode the finished WebM before uploading it.
                         check = subprocess.run(
-                            [ffmpeg, "-v", "error", "-i", str(output), "-f", "null", "-"],
+                            [
+                                ffmpeg, "-v", "error", "-i", str(output),
+                                "-map", "0:v:0", "-f", "framemd5", "-",
+                            ],
                             capture_output=True, timeout=60,
                         )
-                        if check.returncode == 0:
+                        decoded_frames = [
+                            line for line in check.stdout.decode("utf-8", errors="ignore").splitlines()
+                            if line and not line.startswith("#")
+                        ]
+                        if check.returncode == 0 and len(decoded_frames) >= 2:
                             break
-                        last_error = check.stderr.decode("utf-8", errors="ignore")[-700:]
+                        last_error = (
+                            check.stderr.decode("utf-8", errors="ignore")[-500:]
+                            or f"decoded_frames={len(decoded_frames)}"
+                        )
                     data = b""
 
                 if not data or len(data) > 180 * 1024:
