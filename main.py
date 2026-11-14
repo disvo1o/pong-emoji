@@ -65,28 +65,32 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             image.load()
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Слишком большое изображение. Максимум — 30 мегапикселей.")
-            # Prepare ONE square master image, then cut every tile from its exact
-            # pixel coordinates. No blurred padding or per-tile resizing: adjacent
-            # edges therefore come from the same source pixels.
+            # Fit the COMPLETE source into one square master canvas.
+            # Do not crop portrait/landscape edges.
             size = grid * 100
-            image = ImageOps.fit(
-                image.convert("RGB"),
-                (size, size),
-                method=Image.Resampling.LANCZOS,
-                centering=(0.5, 0.5),
-            ).convert("RGBA")
+            source_image = image.convert("RGBA")
+            fitted = ImageOps.contain(
+                source_image, (size, size), method=Image.Resampling.LANCZOS
+            )
+            image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            image.alpha_composite(
+                fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2)
+            )
 
             result = []
             for row in range(grid):
                 for col in range(grid):
                     tile = image.crop((col * 100, row * 100, (col + 1) * 100, (row + 1) * 100))
+                    artwork = tile.resize((34, 34), Image.Resampling.LANCZOS)
+                    mini_tile = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+                    mini_tile.alpha_composite(artwork, (33, 33))
                     output = BytesIO()
-                    tile.save(output, format="WEBP", quality=88, method=6)
+                    mini_tile.save(output, format="WEBP", quality=90, method=6)
                     data = output.getvalue()
                     quality = 80
                     while len(data) > 60 * 1024 and quality >= 30:
                         output = BytesIO()
-                        tile.save(output, format="WEBP", quality=quality, method=6)
+                        mini_tile.save(output, format="WEBP", quality=quality, method=6)
                         data = output.getvalue()
                         quality -= 10
                     if len(data) > 60 * 1024:
@@ -151,13 +155,13 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
         non_video = [
             index + 1
             for index, sticker in enumerate(sticker_set.stickers)
-            if getattr(sticker, "is_video", None) is not True
+            if not bool(getattr(sticker, "is_video", False))
         ]
         logger.info(
-            "Telegram sticker verification: set_type=%s, stickers=%s, non_video=%s",
+            "Telegram sticker verification: set_type=%s, stickers=%s, video_flags=%s",
             sticker_set.sticker_type,
             len(sticker_set.stickers),
-            non_video,
+            [bool(getattr(sticker, "is_video", False)) for sticker in sticker_set.stickers],
         )
         if non_video:
             raise RuntimeError(
@@ -175,53 +179,84 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
 def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     results = []
+
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        source = root / 'source_video'
+        source = root / "source_video"
         source.write_bytes(raw)
+
+        # Decode and normalize the source ONCE. Every tile is cropped from
+        # this exact master, so scale, crop and frame timing cannot drift.
+        master_size = grid * 100
+        master_video = root / "master.nut"
+        master_vf = (
+            f"fps=30,"
+            f"scale={master_size}:{master_size}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"format=yuva420p,"
+            f"pad={master_size}:{master_size}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+            f"setsar=1"
+        )
+        normalize_cmd = [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(source), "-t", "3", "-an", "-vf", master_vf,
+            "-c:v", "ffv1", "-pix_fmt", "yuva420p", "-r", "30", str(master_video),
+        ]
+        normalized = subprocess.run(normalize_cmd, capture_output=True, timeout=120)
+        if normalized.returncode or not master_video.exists() or master_video.stat().st_size == 0:
+            logger.error("Video normalization failed: %s", normalized.stderr.decode("utf-8", errors="ignore")[-1200:])
+            raise ValueError("Не удалось подготовить видео. Попробуй другой файл.")
+
         for row in range(grid):
             for col in range(grid):
-                output = root / ('tile_%s_%s.webm' % (row, col))
-                # All tiles use the same centered square crop and exact 100x100
-                # coordinates from that master frame. Keep VP9 alpha metadata explicit.
-                master = grid * 100
+                output = root / f"tile_{row}_{col}.webm"
+                # Keep Telegram's mandatory 100x100 canvas, but draw the
+                # tile artwork at one-third scale, centered and transparent.
                 vf = (
-                    f"fps=30,scale={master}:{master}:force_original_aspect_ratio=increase,"
-                    f"crop={master}:{master}:(in_w-out_w)/2:(in_h-out_h)/2,"
-                    f"setsar=1,crop=100:100:{col*100}:{row*100},format=yuva420p"
+                    f"crop=100:100:{col * 100}:{row * 100},"
+                    f"scale=34:34:flags=lanczos,"
+                    f"pad=100:100:33:33:color=black@0,"
+                    f"format=yuva420p"
                 )
-                # Keep a safety margin below Telegram's per-video-sticker size limit.
-                # Retry with progressively lower bitrates instead of uploading a borderline file.
                 data = b""
-                for bitrate, maxrate, bufsize in [
-                    ("100k", "150k", "300k"),
-                    ("70k", "100k", "200k"),
-                    ("45k", "65k", "130k"),
-                    ("30k", "45k", "90k"),
-                ]:
+                last_error = ""
+                for crf in (34, 38, 42, 46, 50):
                     cmd = [
-                        ffmpeg, '-y', '-i', str(source), '-t', '3', '-an', '-vf', vf,
-                        '-c:v', 'libvpx-vp9', '-deadline', 'good', '-cpu-used', '4',
-                        '-row-mt', '1', '-auto-alt-ref', '0',
-                        '-b:v', bitrate, '-maxrate', maxrate, '-bufsize', bufsize,
-                        '-pix_fmt', 'yuva420p', '-metadata:s:v:0', 'alpha_mode=1',
-                        '-r', '20', str(output)
+                        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", str(master_video), "-t", "3", "-an", "-vf", vf,
+                        "-c:v", "libvpx-vp9", "-deadline", "good", "-cpu-used", "4",
+                        "-row-mt", "1", "-auto-alt-ref", "0",
+                        "-b:v", "0", "-crf", str(crf),
+                        "-pix_fmt", "yuva420p", "-metadata:s:v:0", "alpha_mode=1",
+                        "-r", "30", "-f", "webm", str(output),
                     ]
-                    p = subprocess.run(cmd, capture_output=True, timeout=90)
+                    p = subprocess.run(cmd, capture_output=True, timeout=120)
                     if p.returncode or not output.exists():
-                        error_tail = p.stderr.decode("utf-8", errors="ignore")[-500:]
-                        logger.error("ffmpeg failed for tile %s,%s: %s", row, col, error_tail)
-                        raise ValueError('Не удалось обработать видео. Попробуй другой файл.')
+                        last_error = p.stderr.decode("utf-8", errors="ignore")[-700:]
+                        continue
                     data = output.read_bytes()
                     if data and len(data) <= 180 * 1024:
-                        break
+                        # Decode the finished WebM before uploading it.
+                        check = subprocess.run(
+                            [ffmpeg, "-v", "error", "-i", str(output), "-f", "null", "-"],
+                            capture_output=True, timeout=60,
+                        )
+                        if check.returncode == 0:
+                            break
+                        last_error = check.stderr.decode("utf-8", errors="ignore")[-700:]
+                    data = b""
+
                 if not data or len(data) > 180 * 1024:
+                    logger.error("Could not encode video tile %s,%s: %s", row, col, last_error)
                     raise ValueError(
-                        f'Фрагмент {row + 1}:{col + 1} не удалось сжать до безопасного размера. '
-                        'Попробуй более короткое видео или меньшую сетку.'
+                        f"Не удалось подготовить видеофрагмент {row + 1}:{col + 1}. "
+                        "Попробуй видео короче или меньшую сетку."
                     )
-                logger.info("Video tile %s/%s size: %s bytes", row * grid + col + 1, grid * grid, len(data))
+                logger.info(
+                    "Video tile %s/%s: %s bytes, validated WebM/VP9",
+                    row * grid + col + 1, grid * grid, len(data),
+                )
                 results.append(data)
+
     return results
 
 def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
