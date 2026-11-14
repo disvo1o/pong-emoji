@@ -327,7 +327,7 @@ async def receive_photo(message: Message, state: FSMContext) -> None:
         await message.answer("Файл слишком большой. Максимальный размер — 15 МБ.")
         return
     await state.set_state(PuzzleState.choosing_grid)
-    await state.update_data(image_bytes=raw, media_type="image")
+    await state.update_data(image_bytes=raw, media_type="image", source_message_id=message.message_id)
     await message.answer("Выбери, на сколько эмодзи разрезать фотографию:", reply_markup=grid_keyboard())
 
 
@@ -368,7 +368,7 @@ async def receive_document(message: Message, state: FSMContext) -> None:
         await message.answer("Файл слишком большой. Максимальный размер — 15 МБ.")
         return
     await state.set_state(PuzzleState.choosing_grid)
-    await state.update_data(image_bytes=raw, media_type="video" if is_video else "image")
+    await state.update_data(image_bytes=raw, media_type="video" if is_video else "image", source_message_id=message.message_id)
     await message.answer("Выбери сетку. Будут использованы первые 3 секунды видео:" if is_video else "Выбери размер пазла:", reply_markup=grid_keyboard())
 
 
@@ -378,6 +378,7 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     raw = data.get("image_bytes")
     is_video = data.get("media_type") == "video"
+    source_message_id = data.get("source_message_id")
     if not raw:
         await state.clear()
         await callback.message.answer("Изображение потерялось. Отправь фотографию ещё раз.")
@@ -401,7 +402,8 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
             "Миниатюра всей картинки — ниже. В наборе фрагменты сохраняют полный размер и стыкуются без промежутков."
         )
         await callback.message.answer_photo(
-            BufferedInputFile(preview, filename="mosaic_preview.png")
+            BufferedInputFile(preview, filename="mosaic_preview.png"),
+            reply_to_message_id=source_message_id,
         )
         await callback.message.answer(
             f"➕ <a href=\"https://t.me/addemoji/{pack_name}\">Добавить набор эмодзи в Telegram</a>",
