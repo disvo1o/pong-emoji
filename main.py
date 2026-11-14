@@ -80,18 +80,14 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             for row in range(grid):
                 for col in range(grid):
                     tile = image.crop((col * 100, row * 100, (col + 1) * 100, (row + 1) * 100))
-                    # Keep each fragment visible, but draw it at one-third scale
-                    # inside Telegram's required 100x100 transparent canvas.
-                    artwork = tile.resize((34, 34), Image.Resampling.LANCZOS)
-                    mini_tile = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-                    mini_tile.alpha_composite(artwork, (33, 33))
+                    # Keep the complete 100x100 fragment so adjacent emoji touch.
                     output = BytesIO()
-                    mini_tile.save(output, format="WEBP", quality=90, method=6)
+                    tile.save(output, format="WEBP", quality=90, method=6)
                     data = output.getvalue()
                     quality = 80
                     while len(data) > 60 * 1024 and quality >= 30:
                         output = BytesIO()
-                        mini_tile.save(output, format="WEBP", quality=quality, method=6)
+                        tile.save(output, format="WEBP", quality=quality, method=6)
                         data = output.getvalue()
                         quality -= 10
                     if len(data) > 60 * 1024:
@@ -100,6 +96,45 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             return result
     except (UnidentifiedImageError, OSError) as exc:
         raise ValueError("Не получилось прочитать изображение. Отправь JPG, PNG или WEBP.") from exc
+
+
+def make_mosaic_preview(raw: bytes, grid: int, video: bool = False) -> bytes:
+    """Build a miniature image of the complete mosaic for the chat preview."""
+    size = grid * 100
+    if video:
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        vf = (
+            f"scale={size}:{size}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"format=rgba,"
+            f"pad={size}:{size}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+        )
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", "-frames:v", "1", "-vf", vf,
+            "-f", "image2pipe", "-vcodec", "png", "pipe:1",
+        ]
+        proc = subprocess.run(cmd, input=raw, capture_output=True, timeout=90)
+        if proc.returncode or not proc.stdout:
+            logger.error("Could not create video mosaic preview: %s", proc.stderr.decode("utf-8", errors="ignore")[-800:])
+            raise ValueError("Не удалось подготовить миниатюру видео.")
+        with Image.open(BytesIO(proc.stdout)) as frame:
+            image = frame.convert("RGBA")
+    else:
+        try:
+            with Image.open(BytesIO(raw)) as source:
+                source = ImageOps.exif_transpose(source)
+                source.load()
+                fitted = ImageOps.contain(source.convert("RGBA"), (size, size), method=Image.Resampling.LANCZOS)
+                image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                image.alpha_composite(fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2))
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError("Не получилось собрать миниатюру изображения.") from exc
+
+    preview_size = max(1, round(size / 3))
+    image = image.resize((preview_size, preview_size), Image.Resampling.LANCZOS)
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], video: bool = False) -> tuple[str, list[str]]:
@@ -214,14 +249,8 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
         for row in range(grid):
             for col in range(grid):
                 output = root / f"tile_{row}_{col}.webm"
-                # Crop every tile from the same master, then shrink only its
-                # visible artwork inside the required 100x100 transparent canvas.
-                vf = (
-                    f"crop=100:100:{col * 100}:{row * 100},"
-                    f"scale=34:34:flags=lanczos,"
-                    f"pad=100:100:33:33:color=black@0,"
-                    f"format=yuva420p"
-                )
+                # Preserve the full 100x100 crop so adjacent emoji touch.
+                vf = f"crop=100:100:{col * 100}:{row * 100},format=yuva420p"
                 data = b""
                 last_error = ""
                 for crf in (34, 38, 42, 46, 50):
@@ -273,27 +302,6 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
                 results.append(data)
 
     return results
-
-def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
-    # Telegram entity offsets are measured in UTF-16 code units.
-    placeholder = "🧩"
-    lines = []
-    entities = []
-    offset = 0
-    for row in range(grid):
-        lines.append(placeholder * grid)
-        for _ in range(grid):
-            entities.append(MessageEntity(
-                type="custom_emoji",
-                offset=offset,
-                length=2,
-                custom_emoji_id=emoji_ids[row * grid + (_)],
-            ))
-            offset += 2
-        if row != grid - 1:
-            offset += 1  # newline
-    return "\n".join(lines), entities
-
 
 @dp.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
@@ -387,15 +395,13 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
         tiles = await asyncio.to_thread(make_video_tiles if is_video else make_tiles, raw, grid)
         pack_name, emoji_ids = await create_custom_emoji_pack(callback.from_user.id, grid, tiles, video=is_video)
 
-        preview_text, entities = build_emoji_preview(grid, emoji_ids)
+        preview = await asyncio.to_thread(make_mosaic_preview, raw, grid, is_video)
         await callback.message.answer(
             f"Готово! {grid}×{grid} = {grid * grid} отдельных эмодзи.\n"
-            "Ниже — собранная картинка. Добавь набор, чтобы использовать каждый фрагмент отдельно."
+            "Миниатюра всей картинки — ниже. В наборе фрагменты сохраняют полный размер и стыкуются без промежутков."
         )
-        await callback.message.answer(
-            preview_text,
-            entities=entities,
-            link_preview_options={"is_disabled": True},
+        await callback.message.answer_photo(
+            BufferedInputFile(preview, filename="mosaic_preview.png")
         )
         await callback.message.answer(
             f"➕ <a href=\"https://t.me/addemoji/{pack_name}\">Добавить набор эмодзи в Telegram</a>",
