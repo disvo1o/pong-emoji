@@ -48,37 +48,39 @@ class PuzzleState(StatesGroup):
 
 
 def grid_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    values = list(range(3, 11))
-    for i in range(0, len(values), 2):
-        rows.append([
-            InlineKeyboardButton(text=f"{n}×{n} · {n*n} эмодзи", callback_data=f"grid:{n}")
-            for n in values[i:i + 2]
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{rows}×{cols} · {rows * cols}",
+            callback_data=f"grid:{rows}:{cols}",
+        )
+        for rows in (1, 2)
+        for cols in range(1, 11)
+    ]
+    keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def make_tiles(raw: bytes, grid: int) -> list[bytes]:
+def make_tiles(raw: bytes, rows: int, cols: int) -> list[bytes]:
     try:
         with Image.open(BytesIO(raw)) as source:
             image = ImageOps.exif_transpose(source)
             image.load()
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 raise ValueError("Слишком большое изображение. Максимум — 30 мегапикселей.")
-            # Fit the COMPLETE source into one square master canvas.
-            # Do not crop portrait/landscape edges.
-            size = grid * 100
+            # Fit the complete source into a canvas matching the selected grid.
+            # Preserve the full source without cropping its edges.
+            width, height = cols * 100, rows * 100
             source_image = image.convert("RGBA")
             fitted = ImageOps.contain(
-                source_image, (size, size), method=Image.Resampling.LANCZOS
+                source_image, (width, height), method=Image.Resampling.LANCZOS
             )
-            image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             image.alpha_composite(
-                fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2)
+                fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2)
             )
             result = []
-            for row in range(grid):
-                for col in range(grid):
+            for row in range(rows):
+                for col in range(cols):
                     tile = image.crop((col * 100, row * 100, (col + 1) * 100, (row + 1) * 100))
                     # Keep the complete 100x100 fragment so adjacent emoji touch.
                     output = BytesIO()
@@ -137,7 +139,7 @@ def make_mosaic_preview(raw: bytes, grid: int, video: bool = False) -> bytes:
     return output.getvalue()
 
 
-async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], video: bool = False) -> tuple[str, list[str]]:
+async def create_custom_emoji_pack(user_id: int, rows: int, cols: int, tiles: list[bytes], video: bool = False) -> tuple[str, list[str]]:
     me = await bot.get_me()
     username = (me.username or "").lower()
     if not username:
@@ -146,7 +148,7 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
     # Telegram requires the pack name to end with _by_<bot_username>.
     unique = time.time_ns() // 1_000_000
     pack_name = f"p{user_id}_{unique}_by_{username}"
-    pack_title = f"Эмодзи-пазл {grid}×{grid}"
+    pack_title = f"Эмодзи-пазл {rows}×{cols}"
     # Final local guard: never send files close to Telegram's hard upload limits.
     max_upload_size = 180 * 1024 if video else 60 * 1024
     oversized = [(i + 1, len(data)) for i, data in enumerate(tiles) if not data or len(data) > max_upload_size]
@@ -216,7 +218,7 @@ async def create_custom_emoji_pack(user_id: int, grid: int, tiles: list[bytes], 
     return pack_name, ids
 
 
-def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
+def make_video_tiles(raw: bytes, rows: int, cols: int) -> list[bytes]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     results = []
 
@@ -227,13 +229,13 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
 
         # Decode and normalize the source ONCE. Every tile is cropped from
         # this exact master, so scale, crop and frame timing cannot drift.
-        master_size = grid * 100
+        master_width, master_height = cols * 100, rows * 100
         master_video = root / "master.nut"
         master_vf = (
             f"fps=30,"
-            f"scale={master_size}:{master_size}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"scale={master_width}:{master_height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
             f"format=yuva420p,"
-            f"pad={master_size}:{master_size}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+            f"pad={master_width}:{master_height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
             f"setsar=1"
         )
         normalize_cmd = [
@@ -246,8 +248,8 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
             logger.error("Video normalization failed: %s", normalized.stderr.decode("utf-8", errors="ignore")[-1200:])
             raise ValueError("Не удалось подготовить видео. Попробуй другой файл.")
 
-        for row in range(grid):
-            for col in range(grid):
+        for row in range(rows):
+            for col in range(cols):
                 output = root / f"tile_{row}_{col}.webm"
                 # Preserve the full 100x100 crop so adjacent emoji touch.
                 vf = f"crop=100:100:{col * 100}:{row * 100},format=yuva420p"
@@ -297,26 +299,26 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
                     )
                 logger.info(
                     "Video tile %s/%s: %s bytes, validated WebM/VP9",
-                    row * grid + col + 1, grid * grid, len(data),
+                    row * cols + col + 1, rows * cols, len(data),
                 )
                 results.append(data)
 
     return results
 
-def build_emoji_preview(grid: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
+def build_emoji_preview(rows: int, cols: int, emoji_ids: list[str]) -> tuple[str, list[MessageEntity]]:
     # Telegram entity offsets are measured in UTF-16 code units.
     placeholder = "🧩"
     lines = []
     entities = []
     offset = 0
-    for row in range(grid):
-        lines.append(placeholder * grid)
-        for col in range(grid):
+    for row in range(rows):
+        lines.append(placeholder * cols)
+        for col in range(cols):
             entities.append(MessageEntity(
                 type="custom_emoji",
                 offset=offset,
                 length=2,
-                custom_emoji_id=emoji_ids[row * grid + col],
+                custom_emoji_id=emoji_ids[row * cols + col],
             ))
             offset += 2
         if row != grid - 1:
@@ -329,7 +331,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Привет! Я превращаю фото и видео в набор настоящих Telegram Custom Emoji 🧩\n\n"
-        "Отправь фото или видео — я разрежу его на пазлы от 3×3 до 10×10, "
+        "Отправь фото или видео — я разрежу его на сетку от 1×1 до 2×10, "
         "создам персональный набор эмодзи и покажу собранную картинку."
     )
 
@@ -349,7 +351,7 @@ async def receive_photo(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(PuzzleState.choosing_grid)
     await state.update_data(image_bytes=raw, media_type="image", source_message_id=message.message_id)
-    await message.answer("Выбери, на сколько эмодзи разрезать фотографию:", reply_markup=grid_keyboard())
+    await message.answer("Выбери размер сетки (строки × столбцы):", reply_markup=grid_keyboard())
 
 
 @dp.message(F.video)
@@ -366,8 +368,8 @@ async def receive_video(message: Message, state: FSMContext) -> None:
         await message.answer('Видео слишком большое. Максимум 15 МБ.')
         return
     await state.set_state(PuzzleState.choosing_grid)
-    await state.update_data(image_bytes=raw, media_type='video')
-    await message.answer('Выбери сетку. Будут использованы первые 3 секунды видео:', reply_markup=grid_keyboard())
+    await state.update_data(image_bytes=raw, media_type="video", source_message_id=message.message_id)
+    await message.answer("Выбери размер сетки (строки × столбцы). Используются первые 3 секунды видео:", reply_markup=grid_keyboard())
 
 
 @dp.message(F.document)
@@ -390,7 +392,7 @@ async def receive_document(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(PuzzleState.choosing_grid)
     await state.update_data(image_bytes=raw, media_type="video" if is_video else "image", source_message_id=message.message_id)
-    await message.answer("Выбери сетку. Будут использованы первые 3 секунды видео:" if is_video else "Выбери размер пазла:", reply_markup=grid_keyboard())
+    await message.answer("Выбери сетку. Будут использованы первые 3 секунды видео:" if is_video else "Выбери размер сетки (строки × столбцы):", reply_markup=grid_keyboard())
 
 
 @dp.callback_query(PuzzleState.choosing_grid, F.data.startswith("grid:"))
@@ -405,21 +407,31 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.answer("Изображение потерялось. Отправь фотографию ещё раз.")
         return
 
-    grid = int(callback.data.split(":", 1)[1])
-    if grid < 3 or grid > 10:
+    try:
+        _, rows_text, cols_text = callback.data.split(":")
+        rows, cols = int(rows_text), int(cols_text)
+    except (ValueError, AttributeError):
+        return
+    if rows not in (1, 2) or not 1 <= cols <= 10:
         return
 
     await state.clear()
-    status = await callback.message.answer(f"🧩 Готовлю {grid * grid} эмодзи… Это может занять немного времени.")
+    status = await callback.message.answer(
+        f"🧩 Готовлю сетку {rows}×{cols} ({rows * cols} эмодзи)… Это может занять немного времени."
+    )
     await bot.send_chat_action(callback.message.chat.id, ChatAction.TYPING)
 
     try:
-        tiles = await asyncio.to_thread(make_video_tiles if is_video else make_tiles, raw, grid)
-        pack_name, emoji_ids = await create_custom_emoji_pack(callback.from_user.id, grid, tiles, video=is_video)
+        tiles = await asyncio.to_thread(
+            make_video_tiles if is_video else make_tiles, raw, rows, cols
+        )
+        pack_name, emoji_ids = await create_custom_emoji_pack(
+            callback.from_user.id, rows, cols, tiles, video=is_video
+        )
 
-        preview_text, entities = build_emoji_preview(grid, emoji_ids)
+        preview_text, entities = build_emoji_preview(rows, cols, emoji_ids)
         await callback.message.answer(
-            f"Готово! {grid}×{grid} = {grid * grid} отдельных эмодзи. Ниже — собранная картинка из самих эмодзи.",
+            f"Готово! {rows}×{cols} = {rows * cols} отдельных эмодзи. Ниже — собранная картинка из самих эмодзи.",
         )
         await callback.message.answer(
             preview_text,
