@@ -48,13 +48,14 @@ class PuzzleState(StatesGroup):
 
 
 def grid_keyboard() -> InlineKeyboardMarkup:
+    sizes = [(rows, cols) for rows in (1, 2) for cols in range(1, 11)]
+    sizes += [(n, n) for n in range(3, 11)]
     buttons = [
         InlineKeyboardButton(
             text=f"{rows}×{cols} · {rows * cols}",
             callback_data=f"grid:{rows}:{cols}",
         )
-        for rows in (1, 2)
-        for cols in range(1, 11)
+        for rows, cols in sizes
     ]
     keyboard = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -331,7 +332,7 @@ async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Привет! Я превращаю фото и видео в набор настоящих Telegram Custom Emoji 🧩\n\n"
-        "Отправь фото или видео — я разрежу его на сетку от 1×1 до 2×10, "
+        "Отправь фото или видео — доступны сетки 1×1–2×10 и квадратные 3×3–10×10, "
         "создам персональный набор эмодзи и покажу собранную картинку."
     )
 
@@ -412,7 +413,12 @@ async def choose_grid(callback: CallbackQuery, state: FSMContext) -> None:
         rows, cols = int(rows_text), int(cols_text)
     except (ValueError, AttributeError):
         return
-    if rows not in (1, 2) or not 1 <= cols <= 10:
+    valid_size = (
+        rows in (1, 2) and 1 <= cols <= 10
+    ) or (
+        3 <= rows <= 10 and rows == cols
+    )
+    if not valid_size:
         return
 
     await state.clear()
