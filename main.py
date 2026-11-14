@@ -76,21 +76,29 @@ def make_tiles(raw: bytes, grid: int) -> list[bytes]:
             image.alpha_composite(
                 fitted, ((size - fitted.width) // 2, (size - fitted.height) // 2)
             )
+            # Scale the COMPLETE master artwork to one third, then split it.
+            # This preserves continuity between neighboring emoji tiles.
+            mini_size = max(2, (size // 3) // 2 * 2)
+            miniature = image.resize(
+                (mini_size, mini_size), Image.Resampling.LANCZOS
+            )
+            mini_master = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            mini_master.alpha_composite(
+                miniature, ((size - mini_size) // 2, (size - mini_size) // 2)
+            )
+            image = mini_master
 
             result = []
             for row in range(grid):
                 for col in range(grid):
                     tile = image.crop((col * 100, row * 100, (col + 1) * 100, (row + 1) * 100))
-                    artwork = tile.resize((34, 34), Image.Resampling.LANCZOS)
-                    mini_tile = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-                    mini_tile.alpha_composite(artwork, (33, 33))
                     output = BytesIO()
-                    mini_tile.save(output, format="WEBP", quality=90, method=6)
+                    tile.save(output, format="WEBP", quality=90, method=6)
                     data = output.getvalue()
                     quality = 80
                     while len(data) > 60 * 1024 and quality >= 30:
                         output = BytesIO()
-                        mini_tile.save(output, format="WEBP", quality=quality, method=6)
+                        tile.save(output, format="WEBP", quality=quality, method=6)
                         data = output.getvalue()
                         quality -= 10
                     if len(data) > 60 * 1024:
@@ -194,6 +202,8 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
             f"scale={master_size}:{master_size}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
             f"format=yuva420p,"
             f"pad={master_size}:{master_size}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+            f"scale=trunc(iw/3/2)*2:trunc(ih/3/2)*2:flags=lanczos,"
+            f"pad={master_size}:{master_size}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
             f"setsar=1"
         )
         normalize_cmd = [
@@ -209,14 +219,8 @@ def make_video_tiles(raw: bytes, grid: int) -> list[bytes]:
         for row in range(grid):
             for col in range(grid):
                 output = root / f"tile_{row}_{col}.webm"
-                # Keep Telegram's mandatory 100x100 canvas, but draw the
-                # tile artwork at one-third scale, centered and transparent.
-                vf = (
-                    f"crop=100:100:{col * 100}:{row * 100},"
-                    f"scale=34:34:flags=lanczos,"
-                    f"pad=100:100:33:33:color=black@0,"
-                    f"format=yuva420p"
-                )
+                # Crop each 100x100 tile from the same already-miniaturized master.
+                vf = f"crop=100:100:{col * 100}:{row * 100},format=yuva420p"
                 data = b""
                 last_error = ""
                 for crf in (34, 38, 42, 46, 50):
